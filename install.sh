@@ -717,7 +717,7 @@ self_install() {
 }
 
 status_line() {
-  local service_state ipf relay_state
+  local service_state relay_state
 
   if have_cmd systemctl; then
     if systemctl is-active --quiet nftables; then
@@ -731,12 +731,6 @@ status_line() {
     service_state="$(color "$C_YELLOW" "unknown")"
   fi
 
-  if have_cmd sysctl; then
-    ipf="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "unknown")"
-  else
-    ipf="unknown"
-  fi
-
   load_config
   if [ -n "$RELAY_LAN_IP" ]; then
     relay_state="$(color "$C_GREEN" "$RELAY_LAN_IP")"
@@ -745,7 +739,6 @@ status_line() {
   fi
 
   echo "$(color "$C_BOLD" "nftables 服务:") ${service_state}"
-  echo "$(color "$C_BOLD" "ip_forward:") $(color "$C_CYAN" "$ipf")"
   echo "$(color "$C_BOLD" "本机 PO0 内网 IP:") ${relay_state}"
 }
 
@@ -834,7 +827,6 @@ install_nftables() {
 
 show_forwards() {
   local id in_port dest_ip dest_port remark
-  local table_file=""
 
   ensure_storage
   load_config
@@ -846,31 +838,20 @@ show_forwards() {
     return 0
   fi
 
-  table_file="$(mktemp /tmp/nft-forward.table.XXXXXX)"
-  {
-    printf -- "ID\t入口端口\t落地机IP\t落地机端口\t备注\n"
-    printf -- "--\t--------\t--------\t----------\t----\n"
+  printf "%-6s %-14s %-18s %-14s %s\n" "ID" "IN_PORT" "DEST_IP" "DEST_PORT" "REMARK"
+  printf "%-6s %-14s %-18s %-14s %s\n" "------" "--------------" "------------------" "--------------" "------------------------------"
 
-    while IFS='|' read -r id in_port dest_ip dest_port remark; do
-      [ -n "$id" ] || continue
-      [[ "$id" =~ ^[0-9]+$ ]] || continue
-      in_port="$(normalize_port "$in_port" 2>/dev/null || true)"
-      dest_port="$(normalize_port "$dest_port" 2>/dev/null || true)"
-      remark="$(normalize_rule_note "${remark:-}")"
-      [ -n "$in_port" ] || continue
-      [ -n "$dest_port" ] || continue
-      is_valid_ipv4 "$dest_ip" || continue
-      printf -- "%s\t%s\t%s\t%s\t%s\n" "$id" "$in_port" "$dest_ip" "$dest_port" "${remark:--}"
-    done < <(sort -t'|' -k1,1n "${RULES_FILE}")
-  } > "${table_file}"
-
-  if have_cmd column; then
-    column -t -s $'\t' "${table_file}"
-  else
-    cat "${table_file}"
-  fi
-
-  rm -f "${table_file}"
+  while IFS='|' read -r id in_port dest_ip dest_port remark; do
+    [ -n "$id" ] || continue
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    in_port="$(normalize_port "$in_port" 2>/dev/null || true)"
+    dest_port="$(normalize_port "$dest_port" 2>/dev/null || true)"
+    remark="$(normalize_rule_note "${remark:-}")"
+    [ -n "$in_port" ] || continue
+    [ -n "$dest_port" ] || continue
+    is_valid_ipv4 "$dest_ip" || continue
+    printf "%-6s %-14s %-18s %-14s %s\n" "$id" "$in_port" "$dest_ip" "$dest_port" "${remark:--}"
+  done < <(sort -t'|' -k1,1n "${RULES_FILE}")
 }
 
 add_forward() {
