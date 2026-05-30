@@ -384,7 +384,7 @@ load_config() {
   fi
 
   if [ -n "$RELAY_LAN_IP" ] && ! is_valid_ipv4 "$RELAY_LAN_IP"; then
-    echo_warn "检测到已保存的本机 PO0 内网 IP 非法，已忽略。"
+    echo_warn "检测到已保存的本机 SNAT IP 非法，已忽略。"
     RELAY_LAN_IP=""
   fi
 }
@@ -397,9 +397,9 @@ save_config() {
 ensure_relay_lan_ip() {
   load_config
   if [ -z "$RELAY_LAN_IP" ]; then
-    RELAY_LAN_IP="$(prompt_ipv4 "请输入本机 PO0 内网 IP（用于 SNAT，通常就是本机内网/专线 IP）")" || return 1
+    RELAY_LAN_IP="$(prompt_ipv4 "请输入本机用于 SNAT 的 IP（通常填写内网/专线 IP；如果没有内网 IP，请填写本机公网 IP）")" || return 1
     save_config
-    echo_ok "本机 PO0 内网 IP 已保存: ${RELAY_LAN_IP}"
+    echo_ok "本机 SNAT IP 已保存: ${RELAY_LAN_IP}"
   fi
 }
 
@@ -659,7 +659,7 @@ apply_rules() {
 
   load_config
   if [ -s "${RULES_FILE}" ] && [ -z "$RELAY_LAN_IP" ]; then
-    echo_err "存在转发规则，但本机 PO0 内网 IP 未设置，无法应用。"
+    echo_err "存在转发规则，但本机 SNAT IP 未设置，无法应用。"
     return 1
   fi
 
@@ -773,7 +773,7 @@ status_line() {
   fi
 
   echo "$(color "$C_BOLD" "nftables 服务:") ${service_state}"
-  echo "$(color "$C_BOLD" "本机 PO0 内网 IP:") ${relay_state}"
+  echo "$(color "$C_BOLD" "本机 SNAT IP:") ${relay_state}"
 }
 
 print_menu() {
@@ -844,13 +844,13 @@ install_nftables() {
 
   load_config
   if [ -z "$RELAY_LAN_IP" ]; then
-    if prompt_yes_no "尚未设置本机 PO0 内网 IP（用于 SNAT 源地址），是否现在设置? [Y/n]: " "yes"; then
+    if prompt_yes_no "尚未设置本机 SNAT IP（通常填写内网/专线 IP；如果没有内网 IP，请填写本机公网 IP），是否现在设置? [Y/n]: " "yes"; then
       ensure_relay_lan_ip || return 1
     else
-      echo_warn "暂未设置本机 PO0 内网 IP，添加转发时会再次要求输入。"
+      echo_warn "暂未设置本机 SNAT IP，添加转发时会再次要求输入。"
     fi
   else
-    echo_info "当前本机 PO0 内网 IP: ${RELAY_LAN_IP}"
+    echo_info "当前本机 SNAT IP: ${RELAY_LAN_IP}"
   fi
 
   self_install
@@ -1151,14 +1151,14 @@ modify_forward() {
   new_remark="$(prompt_rule_note "新的备注（可留空，输入 - 可清空）" "$cur_remark")" || return 1
 
   if [ -n "$RELAY_LAN_IP" ]; then
-    echo_info "当前本机 PO0 内网 IP: ${RELAY_LAN_IP}"
+    echo_info "当前本机 SNAT IP: ${RELAY_LAN_IP}"
   else
-    echo_warn "当前本机 PO0 内网 IP: 未设置"
+    echo_warn "当前本机 SNAT IP: 未设置"
   fi
 
   new_relay_ip="$RELAY_LAN_IP"
-  if prompt_yes_no "是否同时修改本机 PO0 内网 IP? [y/N]: " "no"; then
-    new_relay_ip="$(prompt_ipv4 "新的本机 PO0 内网 IP" "${RELAY_LAN_IP:-}")" || return 1
+  if prompt_yes_no "是否同时修改本机 SNAT IP? [y/N]: " "no"; then
+    new_relay_ip="$(prompt_ipv4 "新的本机 SNAT IP（通常填写内网/专线 IP；如果没有内网 IP，请填写本机公网 IP）" "${RELAY_LAN_IP:-}")" || return 1
   fi
 
   old_rules_backup="$(mktemp /tmp/nft-forward.rules.backup.XXXXXX)"
