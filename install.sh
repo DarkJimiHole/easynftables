@@ -19,9 +19,12 @@ BACKUP_DIR="${APP_DIR}/backup"
 ORIGINAL_NFT_CONF_BACKUP="${BACKUP_DIR}/nftables.conf.before-${APP_NAME}"
 SYSCTL_FILE="/etc/sysctl.d/99-${APP_NAME}.conf"
 NFT_CONF="/etc/nftables.conf"
+LOCK_FILE="/run/${APP_NAME}.lock"
 
 RELAY_LAN_IP=""
 NFT_CMD=""
+AUTO_MODE=0
+LOCK_HELD=0
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C_RESET="\033[0m"
@@ -139,6 +142,27 @@ ensure_storage() {
   touch "${RULES_FILE}"
   chmod 700 "${APP_DIR}" "${BACKUP_DIR}"
   chmod 600 "${RULES_FILE}"
+}
+
+acquire_lock() {
+  if ! have_cmd flock; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "${LOCK_FILE}")"
+  exec 200>"${LOCK_FILE}"
+  if ! flock -w 30 200; then
+    echo_err "failed to acquire lock: ${LOCK_FILE}"
+    return 1
+  fi
+  LOCK_HELD=1
+}
+
+release_lock() {
+  if [ "${LOCK_HELD}" = "1" ] && have_cmd flock; then
+    flock -u 200 || true
+    LOCK_HELD=0
+  fi
 }
 
 check_debian_like() {
@@ -601,6 +625,11 @@ install_nftables_pkg_if_needed() {
   }
 
   if ! resolve_nft_cmd; then
+    if [ "${AUTO_MODE}" = "1" ]; then
+      echo_err "nftables is not installed; automation cannot continue."
+      return 1
+    fi
+
     echo_err "安装完成后仍无法找到 nftables 命令，请手动检查系统。"
     return 1
   fi
@@ -635,6 +664,11 @@ apply_rules() {
   fi
 
   if ! resolve_nft_cmd; then
+    if [ "${AUTO_MODE}" = "1" ]; then
+      echo_err "nftables is not installed; automation cannot continue."
+      return 1
+    fi
+
     echo_warn "未安装 nftables。"
     if prompt_yes_no "是否现在自动安装 nftables? [Y/n]: " "yes"; then
       install_nftables_pkg_if_needed || return 1
@@ -905,6 +939,171 @@ find_rule_by_id() {
   ' "${RULES_FILE}"
 }
 
+rewrite_dest_ip_by_id() {
+  local target_id="$1"
+  local new_dest_ip="$2"
+  local tmp_rules old_rules_backup
+
+  [[ "$target_id" =~ ^[0-9]+$ ]] || {
+    echo_err "invalid rule id: ${target_id}"
+    return 1
+  }
+  is_valid_ipv4 "$new_dest_ip" || {
+    echo_err "invalid new IPv4: ${new_dest_ip}"
+    return 1
+  }
+  find_rule_by_id "$target_id" >/dev/null || {
+    echo_err "rule not found: ${target_id}"
+    return 1
+  }
+
+  old_rules_backup="$(mktemp /tmp/nft-forward.rules.backup.XXXXXX)"
+  tmp_rules="$(mktemp /tmp/nft-forward.rules.new.XXXXXX)"
+  cp -a "${RULES_FILE}" "${old_rules_backup}"
+
+  awk -F'|' -v OFS='|' -v id="$target_id" -v dest_ip="$new_dest_ip" '
+    $1 == id { $3 = dest_ip }
+    { print $0 }
+  ' "${RULES_FILE}" > "${tmp_rules}"
+  mv "${tmp_rules}" "${RULES_FILE}"
+
+  if apply_rules; then
+    rm -f "${old_rules_backup}"
+    echo_ok "updated rule dest ip: id=${target_id} new_ip=${new_dest_ip} updated=1"
+    return 0
+  fi
+
+  cp -a "${old_rules_backup}" "${RULES_FILE}"
+  rm -f "${old_rules_backup}"
+  echo_err "update failed; rules database rolled back."
+  return 1
+}
+
+rewrite_dest_ip_by_remark() {
+  local target_remark="$1"
+  local new_dest_ip="$2"
+  local match_mode="${3:-exact}"
+  local tmp_rules old_rules_backup count
+
+  target_remark="$(trim_value "$target_remark")"
+  [ -n "$target_remark" ] || {
+    echo_err "remark must not be empty"
+    return 1
+  }
+  is_valid_ipv4 "$new_dest_ip" || {
+    echo_err "invalid new IPv4: ${new_dest_ip}"
+    return 1
+  }
+  case "$match_mode" in
+    exact|contains) ;;
+    *)
+      echo_err "invalid remark match mode: ${match_mode}"
+      return 1
+      ;;
+  esac
+
+  count="$(awk -F'|' -v remark="$target_remark" -v mode="$match_mode" '
+    function matches(note) {
+      if (mode == "exact") return note == remark
+      return index(note, remark) > 0
+    }
+    matches($5) { c++ }
+    END { print c + 0 }
+  ' "${RULES_FILE}")"
+  [ "$count" -gt 0 ] || {
+    echo_err "no rules matched remark: ${target_remark}"
+    return 1
+  }
+
+  old_rules_backup="$(mktemp /tmp/nft-forward.rules.backup.XXXXXX)"
+  tmp_rules="$(mktemp /tmp/nft-forward.rules.new.XXXXXX)"
+  cp -a "${RULES_FILE}" "${old_rules_backup}"
+
+  awk -F'|' -v OFS='|' -v remark="$target_remark" -v dest_ip="$new_dest_ip" -v mode="$match_mode" '
+    function matches(note) {
+      if (mode == "exact") return note == remark
+      return index(note, remark) > 0
+    }
+    matches($5) { $3 = dest_ip }
+    { print $0 }
+  ' "${RULES_FILE}" > "${tmp_rules}"
+  mv "${tmp_rules}" "${RULES_FILE}"
+
+  if apply_rules; then
+    rm -f "${old_rules_backup}"
+    echo_ok "updated rule dest ip: remark=${target_remark} mode=${match_mode} new_ip=${new_dest_ip} updated=${count}"
+    return 0
+  fi
+
+  cp -a "${old_rules_backup}" "${RULES_FILE}"
+  rm -f "${old_rules_backup}"
+  echo_err "update failed; rules database rolled back."
+  return 1
+}
+
+rewrite_dest_ip_by_current_ip() {
+  local old_dest_ip="$1"
+  local new_dest_ip="$2"
+  local unique="${3:-0}"
+  local tmp_rules old_rules_backup count
+
+  is_valid_ipv4 "$old_dest_ip" || {
+    echo_err "invalid old IPv4: ${old_dest_ip}"
+    return 1
+  }
+  is_valid_ipv4 "$new_dest_ip" || {
+    echo_err "invalid new IPv4: ${new_dest_ip}"
+    return 1
+  }
+
+  count="$(awk -F'|' -v old_ip="$old_dest_ip" '$3 == old_ip { c++ } END { print c + 0 }' "${RULES_FILE}")"
+  [ "$count" -gt 0 ] || {
+    echo_err "no rules matched current ip: ${old_dest_ip}"
+    return 1
+  }
+  if [ "$unique" = "1" ] && [ "$count" -ne 1 ]; then
+    echo_err "unique mode expected 1 match, got ${count}"
+    return 1
+  fi
+
+  old_rules_backup="$(mktemp /tmp/nft-forward.rules.backup.XXXXXX)"
+  tmp_rules="$(mktemp /tmp/nft-forward.rules.new.XXXXXX)"
+  cp -a "${RULES_FILE}" "${old_rules_backup}"
+
+  awk -F'|' -v OFS='|' -v old_ip="$old_dest_ip" -v new_ip="$new_dest_ip" '
+    $3 == old_ip { $3 = new_ip }
+    { print $0 }
+  ' "${RULES_FILE}" > "${tmp_rules}"
+  mv "${tmp_rules}" "${RULES_FILE}"
+
+  if apply_rules; then
+    rm -f "${old_rules_backup}"
+    echo_ok "updated rule dest ip: old_ip=${old_dest_ip} new_ip=${new_dest_ip} updated=${count}"
+    return 0
+  fi
+
+  cp -a "${old_rules_backup}" "${RULES_FILE}"
+  rm -f "${old_rules_backup}"
+  echo_err "update failed; rules database rolled back."
+  return 1
+}
+
+run_automation_update() {
+  local command_name="$1"
+  shift
+
+  AUTO_MODE=1
+  acquire_lock || {
+    AUTO_MODE=0
+    return 1
+  }
+  "$command_name" "$@"
+  local result=$?
+  release_lock
+  AUTO_MODE=0
+  return "$result"
+}
+
 modify_forward() {
   local target_id line
   local cur_id cur_in_port cur_dest_ip cur_dest_port cur_remark
@@ -1112,6 +1311,13 @@ show_help() {
   sudo bash install.sh
   sudo bash install.sh --install-self
   sudo nf
+  sudo nf --apply-rules
+  sudo nf --show-forwards
+  sudo nf --set-dest-ip-by-id <RULE_ID> <NEW_IPV4>
+  sudo nf --set-dest-ip-by-remark <REMARK> <NEW_IPV4>
+  sudo nf --set-dest-ip-by-remark-contains <TEXT> <NEW_IPV4>
+  sudo nf --set-dest-ip-by-current-ip <OLD_IPV4> <NEW_IPV4>
+  sudo nf --set-dest-ip-by-current-ip-unique <OLD_IPV4> <NEW_IPV4>
 EOF
 }
 
@@ -1164,6 +1370,48 @@ main() {
   case "${1:-}" in
     --install-self)
       self_install
+      ;;
+    --apply-rules)
+      AUTO_MODE=1
+      apply_rules || exit 1
+      ;;
+    --show-forwards)
+      show_forwards
+      ;;
+    --set-dest-ip-by-id)
+      if [ "$#" -ne 3 ]; then
+        echo_err "usage: $0 --set-dest-ip-by-id <RULE_ID> <NEW_IPV4>"
+        exit 1
+      fi
+      run_automation_update rewrite_dest_ip_by_id "$2" "$3" || exit 1
+      ;;
+    --set-dest-ip-by-remark)
+      if [ "$#" -ne 3 ]; then
+        echo_err "usage: $0 --set-dest-ip-by-remark <REMARK> <NEW_IPV4>"
+        exit 1
+      fi
+      run_automation_update rewrite_dest_ip_by_remark "$2" "$3" "exact" || exit 1
+      ;;
+    --set-dest-ip-by-remark-contains)
+      if [ "$#" -ne 3 ]; then
+        echo_err "usage: $0 --set-dest-ip-by-remark-contains <TEXT> <NEW_IPV4>"
+        exit 1
+      fi
+      run_automation_update rewrite_dest_ip_by_remark "$2" "$3" "contains" || exit 1
+      ;;
+    --set-dest-ip-by-current-ip)
+      if [ "$#" -ne 3 ]; then
+        echo_err "usage: $0 --set-dest-ip-by-current-ip <OLD_IPV4> <NEW_IPV4>"
+        exit 1
+      fi
+      run_automation_update rewrite_dest_ip_by_current_ip "$2" "$3" "0" || exit 1
+      ;;
+    --set-dest-ip-by-current-ip-unique)
+      if [ "$#" -ne 3 ]; then
+        echo_err "usage: $0 --set-dest-ip-by-current-ip-unique <OLD_IPV4> <NEW_IPV4>"
+        exit 1
+      fi
+      run_automation_update rewrite_dest_ip_by_current_ip "$2" "$3" "1" || exit 1
       ;;
     "")
       self_install
