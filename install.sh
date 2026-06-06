@@ -4,7 +4,7 @@ set -u
 set -o pipefail
 
 APP_NAME="nft-forward"
-SCRIPT_VERSION="v1.3"
+SCRIPT_VERSION="v1.4"
 SHORTCUT_NAME="nf"
 SCRIPT_RAW_URL="https://raw.githubusercontent.com/DarkJimiHole/easynftables/main/install.sh"
 SHORTCUT_BIN="/usr/local/bin/${SHORTCUT_NAME}"
@@ -15,6 +15,11 @@ LEGACY_SHORTCUT_SBIN="/usr/local/sbin/${APP_NAME}"
 APP_DIR="/etc/${APP_NAME}"
 RULES_FILE="${APP_DIR}/forwards.db"
 CONFIG_FILE="${APP_DIR}/config.env"
+REGION_CODES_FILE="${APP_DIR}/region_whitelist.codes"
+MANUAL_WHITELIST_FILE="${APP_DIR}/manual_whitelist.list"
+SETS_DIR="${APP_DIR}/sets"
+MANUAL_WHITELIST_NFT="${SETS_DIR}/manual_whitelist4.nft"
+REGION_WHITELIST_NFT="${SETS_DIR}/region_whitelist4.nft"
 BACKUP_DIR="${APP_DIR}/backup"
 ORIGINAL_NFT_CONF_BACKUP="${BACKUP_DIR}/nftables.conf.before-${APP_NAME}"
 SYSCTL_FILE="/etc/sysctl.d/99-${APP_NAME}.conf"
@@ -22,9 +27,13 @@ NFT_CONF="/etc/nftables.conf"
 LOCK_FILE="/run/${APP_NAME}.lock"
 
 RELAY_LAN_IP=""
+WHITELIST_ENABLE=0
+REGION_WHITELIST_ENABLE=0
 NFT_CMD=""
 AUTO_MODE=0
 LOCK_HELD=0
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd -P || pwd)"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C_RESET="\033[0m"
@@ -88,12 +97,19 @@ prompt_input() {
 
 pause_for_menu() {
   echo ""
-  prompt_input "按回车返回主菜单..." || true
+  prompt_input "按回车继续..." || true
 }
 
 print_section() {
   local title="$1"
   printf "\n%b[%s]%b\n" "$C_GREEN" "$title" "$C_RESET"
+}
+
+clear_screen() {
+  if [ "${NO_CLEAR:-0}" = "1" ] || [ ! -t 1 ]; then
+    return 0
+  fi
+  printf "\033[H\033[2J"
 }
 
 print_menu_item() {
@@ -130,6 +146,109 @@ download_file() {
   return 1
 }
 
+normalize_bool() {
+  local value="${1:-0}"
+  value="$(trim_value "$value")"
+  case "$value" in
+    1|true|TRUE|yes|YES|on|ON|enabled|ENABLED) echo "1" ;;
+    *) echo "0" ;;
+  esac
+}
+
+is_valid_ipv4_cidr() {
+  local raw="$1"
+  local ip prefix
+
+  raw="$(trim_value "$raw")"
+  if is_valid_ipv4 "$raw"; then
+    return 0
+  fi
+
+  [[ "$raw" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+  ip="${raw%/*}"
+  prefix="${raw#*/}"
+  is_valid_ipv4 "$ip" || return 1
+  [ "$prefix" -ge 0 ] && [ "$prefix" -le 32 ]
+}
+
+po0_python() {
+  if have_cmd python3; then
+    python3 "$@"
+  elif have_cmd python; then
+    python "$@"
+  else
+    echo_err "missing python3/python; cannot read region whitelist data."
+    return 127
+  fi
+}
+
+region_tool_file() {
+  if [ -f "${APP_DIR}/tools/region_tool.py" ]; then
+    printf "%s\n" "${APP_DIR}/tools/region_tool.py"
+    return 0
+  fi
+  if [ -f "${SCRIPT_DIR}/tools/region_tool.py" ]; then
+    printf "%s\n" "${SCRIPT_DIR}/tools/region_tool.py"
+    return 0
+  fi
+  return 1
+}
+
+region_data_dir() {
+  if [ -d "${APP_DIR}/data/regions" ] && [ -f "${APP_DIR}/data/regions.json" ]; then
+    printf "%s\n" "${APP_DIR}/data"
+    return 0
+  fi
+  if [ -d "${SCRIPT_DIR}/data/regions" ] && [ -f "${SCRIPT_DIR}/data/regions.json" ]; then
+    printf "%s\n" "${SCRIPT_DIR}/data"
+    return 0
+  fi
+  return 1
+}
+
+region_tool() {
+  local tool data_dir
+
+  if ! tool="$(region_tool_file)"; then
+    echo_err "missing tools/region_tool.py."
+    return 1
+  fi
+  if ! data_dir="$(region_data_dir)"; then
+    echo_err "missing data/regions.json or data/regions/."
+    return 1
+  fi
+
+  po0_python "$tool" --regions-json "${data_dir}/regions.json" --data-dir "$data_dir" "$@"
+}
+
+install_region_assets() {
+  if [ -f "${SCRIPT_DIR}/tools/region_tool.py" ]; then
+    mkdir -p "${APP_DIR}/tools"
+    cp -a "${SCRIPT_DIR}/tools/region_tool.py" "${APP_DIR}/tools/region_tool.py"
+    chmod 600 "${APP_DIR}/tools/region_tool.py" 2>/dev/null || true
+  fi
+
+  if [ -f "${SCRIPT_DIR}/data/regions.json" ] && [ -d "${SCRIPT_DIR}/data/regions" ]; then
+    mkdir -p "${APP_DIR}/data"
+    cp -a "${SCRIPT_DIR}/data/regions.json" "${APP_DIR}/data/regions.json"
+    rm -rf "${APP_DIR}/data/regions"
+    cp -a "${SCRIPT_DIR}/data/regions" "${APP_DIR}/data/regions"
+    chmod -R go-rwx "${APP_DIR}/data" 2>/dev/null || true
+  fi
+}
+
+detect_ssh_client_ip() {
+  if [ -n "${SSH_CONNECTION:-}" ]; then
+    printf "%s\n" "$SSH_CONNECTION" | awk '{print $1}'
+    return 0
+  fi
+  if [ -n "${SSH_CLIENT:-}" ]; then
+    printf "%s\n" "$SSH_CLIENT" | awk '{print $1}'
+    return 0
+  fi
+  return 1
+}
+
 ensure_root() {
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     echo_err "请使用 root 或 sudo 运行该脚本。"
@@ -138,10 +257,10 @@ ensure_root() {
 }
 
 ensure_storage() {
-  mkdir -p "${APP_DIR}" "${BACKUP_DIR}"
-  touch "${RULES_FILE}"
-  chmod 700 "${APP_DIR}" "${BACKUP_DIR}"
-  chmod 600 "${RULES_FILE}"
+  mkdir -p "${APP_DIR}" "${BACKUP_DIR}" "${SETS_DIR}"
+  touch "${RULES_FILE}" "${REGION_CODES_FILE}" "${MANUAL_WHITELIST_FILE}"
+  chmod 700 "${APP_DIR}" "${BACKUP_DIR}" "${SETS_DIR}"
+  chmod 600 "${RULES_FILE}" "${REGION_CODES_FILE}" "${MANUAL_WHITELIST_FILE}"
 }
 
 acquire_lock() {
@@ -379,8 +498,12 @@ prompt_rule_note() {
 
 load_config() {
   RELAY_LAN_IP=""
+  WHITELIST_ENABLE=0
+  REGION_WHITELIST_ENABLE=0
   if [ -f "${CONFIG_FILE}" ]; then
     RELAY_LAN_IP="$(awk -F'=' '/^RELAY_LAN_IP=/{print $2; exit}' "${CONFIG_FILE}" | tr -d '[:space:]')"
+    WHITELIST_ENABLE="$(normalize_bool "$(awk -F'=' '/^WHITELIST_ENABLE=/{print $2; exit}' "${CONFIG_FILE}")")"
+    REGION_WHITELIST_ENABLE="$(normalize_bool "$(awk -F'=' '/^REGION_WHITELIST_ENABLE=/{print $2; exit}' "${CONFIG_FILE}")")"
   fi
 
   if [ -n "$RELAY_LAN_IP" ] && ! is_valid_ipv4 "$RELAY_LAN_IP"; then
@@ -390,7 +513,11 @@ load_config() {
 }
 
 save_config() {
-  printf "RELAY_LAN_IP=%s\n" "$RELAY_LAN_IP" > "${CONFIG_FILE}"
+  {
+    printf "RELAY_LAN_IP=%s\n" "$RELAY_LAN_IP"
+    printf "WHITELIST_ENABLE=%s\n" "${WHITELIST_ENABLE:-0}"
+    printf "REGION_WHITELIST_ENABLE=%s\n" "${REGION_WHITELIST_ENABLE:-0}"
+  } > "${CONFIG_FILE}"
   chmod 600 "${CONFIG_FILE}"
 }
 
@@ -495,8 +622,195 @@ build_dest_ip_var_set() {
   printf "%s" "$output"
 }
 
+split_user_list() {
+  local input="$1"
+  input="${input//,/ }"
+  input="${input//，/ }"
+  input="${input//、/ }"
+  printf "%s\n" "$input" | awk '{ for (i = 1; i <= NF; i++) print $i }'
+}
+
+file_item_count() {
+  local file="$1"
+  awk '
+    {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 != "" && substr($0, 1, 1) != "#") c++
+    }
+    END { print c + 0 }
+  ' "$file"
+}
+
+manual_whitelist_count() {
+  file_item_count "${MANUAL_WHITELIST_FILE}"
+}
+
+region_whitelist_count() {
+  file_item_count "${REGION_CODES_FILE}"
+}
+
+whitelist_has_allowed_sources() {
+  if [ "$(manual_whitelist_count)" -gt 0 ]; then
+    return 0
+  fi
+  if [ "${REGION_WHITELIST_ENABLE:-0}" = "1" ] && [ "$(region_whitelist_count)" -gt 0 ]; then
+    return 0
+  fi
+  return 1
+}
+
+ensure_whitelist_safe() {
+  if [ "${WHITELIST_ENABLE:-0}" != "1" ]; then
+    return 0
+  fi
+
+  if whitelist_has_allowed_sources; then
+    return 0
+  fi
+
+  echo_err "白名单限制已开启，但手动白名单为空，且没有启用任何地区来源。已拒绝应用规则以避免锁定 VPS。"
+  return 1
+}
+
+append_unique_line() {
+  local file="$1"
+  local value="$2"
+
+  touch "$file"
+  if grep -Fxq -- "$value" "$file" 2>/dev/null; then
+    return 0
+  fi
+  printf "%s\n" "$value" >> "$file"
+}
+
+add_manual_whitelist_entry() {
+  local entry="$1"
+
+  entry="$(trim_value "$entry")"
+  [ -n "$entry" ] || return 1
+  if ! is_valid_ipv4_cidr "$entry"; then
+    echo_err "IP/CIDR 非法: ${entry}"
+    return 1
+  fi
+
+  append_unique_line "${MANUAL_WHITELIST_FILE}" "$entry"
+}
+
+ensure_current_ssh_ip_whitelisted() {
+  local ssh_ip
+
+  if ! ssh_ip="$(detect_ssh_client_ip)"; then
+    echo_warn "未检测到当前 SSH 来源 IP，请确认手动白名单中已有管理 IP。"
+    return 0
+  fi
+
+  if ! is_valid_ipv4 "$ssh_ip"; then
+    echo_warn "检测到的 SSH 来源不是有效 IPv4，已跳过自动加入: ${ssh_ip}"
+    return 0
+  fi
+
+  add_manual_whitelist_entry "$ssh_ip" || return 1
+  echo_ok "已将当前 SSH 来源 IP 加入手动白名单: ${ssh_ip}"
+}
+
+collect_manual_whitelist_entries() {
+  local raw entry
+
+  while IFS= read -r raw; do
+    entry="$(trim_value "$raw")"
+    [ -n "$entry" ] || continue
+    [[ "$entry" == \#* ]] && continue
+    if ! is_valid_ipv4_cidr "$entry"; then
+      echo_err "手动白名单包含非法 IP/CIDR: ${entry}"
+      return 1
+    fi
+    printf "%s\n" "$entry"
+  done < "${MANUAL_WHITELIST_FILE}"
+}
+
+collect_region_whitelist_entries() {
+  local codes=()
+
+  [ "${REGION_WHITELIST_ENABLE:-0}" = "1" ] || return 0
+  mapfile -t codes < <(awk '
+    {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 != "" && substr($0, 1, 1) != "#") print $0
+    }
+  ' "${REGION_CODES_FILE}")
+
+  [ "${#codes[@]}" -gt 0 ] || return 0
+  region_tool collect-cidrs "${codes[@]}"
+}
+
+render_nft_set() {
+  local set_name="$1"
+  shift
+  local entries=("$@")
+  local i sep
+
+  echo "    set ${set_name} {"
+  echo "        type ipv4_addr"
+  echo "        flags interval"
+  echo "        auto-merge"
+  if [ "${#entries[@]}" -gt 0 ]; then
+    echo "        elements = {"
+    for i in "${!entries[@]}"; do
+      sep=","
+      if [ "$i" -eq "$((${#entries[@]} - 1))" ]; then
+        sep=""
+      fi
+      echo "            ${entries[$i]}${sep}"
+    done
+    echo "        }"
+  fi
+  echo "    }"
+}
+
+render_nft_set_file() {
+  local set_name="$1"
+  local output_file="$2"
+  shift 2
+  local entries=("$@")
+
+  {
+    echo "# Generated by ${SHORTCUT_NAME}; do not edit manually."
+    render_nft_set "$set_name" "${entries[@]}"
+  } > "$output_file"
+  chmod 600 "$output_file" 2>/dev/null || true
+}
+
+render_whitelist_set_files() {
+  local output_dir="$1"
+  local manual_entries=()
+  local region_entries=()
+  local manual_tmp=""
+  local region_tmp=""
+
+  mkdir -p "$output_dir"
+  manual_tmp="$(mktemp /tmp/nft-forward.manual-whitelist.XXXXXX)"
+  region_tmp="$(mktemp /tmp/nft-forward.region-whitelist.XXXXXX)"
+
+  if ! collect_manual_whitelist_entries > "$manual_tmp"; then
+    rm -f "$manual_tmp" "$region_tmp"
+    return 1
+  fi
+  if ! collect_region_whitelist_entries > "$region_tmp"; then
+    rm -f "$manual_tmp" "$region_tmp"
+    return 1
+  fi
+
+  mapfile -t manual_entries < "$manual_tmp"
+  mapfile -t region_entries < "$region_tmp"
+  rm -f "$manual_tmp" "$region_tmp"
+
+  render_nft_set_file "manual_whitelist4" "${output_dir}/manual_whitelist4.nft" "${manual_entries[@]}"
+  render_nft_set_file "region_whitelist4" "${output_dir}/region_whitelist4.nft" "${region_entries[@]}"
+}
+
 render_nftables_conf() {
   local output_file="$1"
+  local set_include_dir="${2:-$SETS_DIR}"
   local ip_var_set=""
   local rule_count=0
   local i
@@ -581,8 +895,32 @@ render_nftables_conf() {
     echo ""
     echo "# --- 性能优化逻辑 (Filter表) ---"
     echo "table ip filter {"
+    if [ "${WHITELIST_ENABLE:-0}" = "1" ]; then
+      echo "    include \"${set_include_dir}/manual_whitelist4.nft\""
+      echo "    include \"${set_include_dir}/region_whitelist4.nft\""
+      echo ""
+      echo "    chain whitelist_gate {"
+      echo "        ip saddr @manual_whitelist4 return"
+      if [ "${REGION_WHITELIST_ENABLE:-0}" = "1" ]; then
+        echo "        ip saddr @region_whitelist4 return"
+      fi
+      echo "        reject with icmp type admin-prohibited"
+      echo "    }"
+      echo ""
+      echo "    chain input {"
+      echo "        type filter hook input priority 0; policy accept;"
+      echo "        iif lo accept"
+      echo "        ct state established,related accept"
+      echo "        jump whitelist_gate"
+      echo "    }"
+      echo ""
+    fi
     echo "    chain forward {"
     echo "        type filter hook forward priority 0; policy accept;"
+    if [ "${WHITELIST_ENABLE:-0}" = "1" ]; then
+      echo "        ct state established,related accept"
+      echo "        jump whitelist_gate"
+    fi
     if [ "$rule_count" -eq 1 ]; then
       echo "        ip daddr \$DEST_IP tcp flags syn tcp option maxseg size set 1452"
     elif [ -n "$ip_var_set" ]; then
@@ -655,9 +993,16 @@ enable_ip_forward() {
 
 apply_rules() {
   local tmp_conf=""
+  local final_conf=""
   local rollback_conf=""
+  local tmp_sets_dir=""
+  local rollback_sets_dir=""
+  local sets_existed=0
 
   load_config
+  install_region_assets
+  ensure_whitelist_safe || return 1
+
   if [ -s "${RULES_FILE}" ] && [ -z "$RELAY_LAN_IP" ]; then
     echo_err "存在转发规则，但本机 SNAT IP 未设置，无法应用。"
     return 1
@@ -680,14 +1025,32 @@ apply_rules() {
   fi
 
   tmp_conf="$(mktemp /tmp/nft-forward.conf.XXXXXX)"
+  final_conf="$(mktemp /tmp/nft-forward.final-conf.XXXXXX)"
   rollback_conf="$(mktemp /tmp/nft-forward.rollback.XXXXXX)"
+  tmp_sets_dir="$(mktemp -d /tmp/nft-forward.sets.XXXXXX)"
+  rollback_sets_dir="$(mktemp -d /tmp/nft-forward.sets.rollback.XXXXXX)"
 
-  render_nftables_conf "${tmp_conf}"
+  if [ "${WHITELIST_ENABLE:-0}" = "1" ]; then
+    if ! render_whitelist_set_files "$tmp_sets_dir"; then
+      echo_err "生成白名单 set 文件失败，未应用。"
+      rm -f "${tmp_conf}" "${final_conf}" "${rollback_conf}"
+      rm -rf "${tmp_sets_dir}" "${rollback_sets_dir}"
+      return 1
+    fi
+  fi
+
+  if ! render_nftables_conf "${tmp_conf}" "$tmp_sets_dir"; then
+    echo_err "生成 nftables 规则失败，未应用。"
+    rm -f "${tmp_conf}" "${final_conf}" "${rollback_conf}"
+    rm -rf "${tmp_sets_dir}" "${rollback_sets_dir}"
+    return 1
+  fi
 
   if ! "${NFT_CMD}" -c -f "${tmp_conf}" >/dev/null 2>&1; then
     echo_err "规则语法检查失败，未应用。报错如下："
     "${NFT_CMD}" -c -f "${tmp_conf}" 2>&1 | sed "s/^/  /"
-    rm -f "${tmp_conf}" "${rollback_conf}"
+    rm -f "${tmp_conf}" "${final_conf}" "${rollback_conf}"
+    rm -rf "${tmp_sets_dir}" "${rollback_sets_dir}"
     return 1
   fi
 
@@ -697,15 +1060,67 @@ apply_rules() {
     : > "${rollback_conf}"
   fi
 
-  install -m 600 "${tmp_conf}" "${NFT_CONF}"
+  if [ -d "${SETS_DIR}" ]; then
+    sets_existed=1
+    cp -a "${SETS_DIR}/." "${rollback_sets_dir}/" 2>/dev/null || true
+  fi
+
+  if [ "${WHITELIST_ENABLE:-0}" = "1" ]; then
+    mkdir -p "${SETS_DIR}"
+    install -m 600 "${tmp_sets_dir}/manual_whitelist4.nft" "${MANUAL_WHITELIST_NFT}"
+    install -m 600 "${tmp_sets_dir}/region_whitelist4.nft" "${REGION_WHITELIST_NFT}"
+    chmod 700 "${SETS_DIR}" 2>/dev/null || true
+  fi
+
+  if ! render_nftables_conf "${final_conf}" "${SETS_DIR}"; then
+    echo_err "生成最终 nftables 规则失败，正在回滚。"
+    if [ "$sets_existed" = "1" ]; then
+      rm -rf "${SETS_DIR}"
+      mkdir -p "${SETS_DIR}"
+      cp -a "${rollback_sets_dir}/." "${SETS_DIR}/" 2>/dev/null || true
+      chmod 700 "${SETS_DIR}" 2>/dev/null || true
+    else
+      rm -rf "${SETS_DIR}"
+    fi
+    rm -f "${tmp_conf}" "${final_conf}" "${rollback_conf}"
+    rm -rf "${tmp_sets_dir}" "${rollback_sets_dir}"
+    return 1
+  fi
+
+  if ! "${NFT_CMD}" -c -f "${final_conf}" >/dev/null 2>&1; then
+    echo_err "最终规则语法检查失败，正在回滚。报错如下："
+    "${NFT_CMD}" -c -f "${final_conf}" 2>&1 | sed "s/^/  /"
+    if [ "$sets_existed" = "1" ]; then
+      rm -rf "${SETS_DIR}"
+      mkdir -p "${SETS_DIR}"
+      cp -a "${rollback_sets_dir}/." "${SETS_DIR}/" 2>/dev/null || true
+      chmod 700 "${SETS_DIR}" 2>/dev/null || true
+    else
+      rm -rf "${SETS_DIR}"
+    fi
+    rm -f "${tmp_conf}" "${final_conf}" "${rollback_conf}"
+    rm -rf "${tmp_sets_dir}" "${rollback_sets_dir}"
+    return 1
+  fi
+
+  install -m 600 "${final_conf}" "${NFT_CONF}"
 
   if ! "${NFT_CMD}" -f "${NFT_CONF}" >/dev/null 2>&1; then
     echo_err "规则应用失败，正在回滚。"
+    if [ "$sets_existed" = "1" ]; then
+      rm -rf "${SETS_DIR}"
+      mkdir -p "${SETS_DIR}"
+      cp -a "${rollback_sets_dir}/." "${SETS_DIR}/" 2>/dev/null || true
+      chmod 700 "${SETS_DIR}" 2>/dev/null || true
+    else
+      rm -rf "${SETS_DIR}"
+    fi
     if [ -s "${rollback_conf}" ]; then
       install -m 600 "${rollback_conf}" "${NFT_CONF}"
       "${NFT_CMD}" -f "${NFT_CONF}" >/dev/null 2>&1 || true
     fi
-    rm -f "${tmp_conf}" "${rollback_conf}"
+    rm -f "${tmp_conf}" "${final_conf}" "${rollback_conf}"
+    rm -rf "${tmp_sets_dir}" "${rollback_sets_dir}"
     return 1
   fi
 
@@ -714,7 +1129,8 @@ apply_rules() {
     systemctl restart nftables >/dev/null 2>&1 || true
   fi
 
-  rm -f "${tmp_conf}" "${rollback_conf}"
+  rm -f "${tmp_conf}" "${final_conf}" "${rollback_conf}"
+  rm -rf "${tmp_sets_dir}" "${rollback_sets_dir}"
   echo_ok "nftables 规则已应用并尝试重启服务。"
   return 0
 }
@@ -745,6 +1161,7 @@ self_install() {
   install -d -m 0755 "$(dirname "$SHORTCUT_SBIN")"
   install -m 0755 "$self" "$SHORTCUT_BIN"
   install -m 0755 "$self" "$SHORTCUT_SBIN"
+  install_region_assets
 
   rm -f "${LEGACY_SHORTCUT_BIN}" "${LEGACY_SHORTCUT_SBIN}" 2>/dev/null || true
   rm -f "$tmp_file"
@@ -774,6 +1191,501 @@ status_line() {
 
   echo "$(color "$C_BOLD" "nftables 服务:") ${service_state}"
   echo "$(color "$C_BOLD" "本机 SNAT IP:") ${relay_state}"
+  echo "$(color "$C_BOLD" "白名单限制:") $(bool_label "$WHITELIST_ENABLE")"
+}
+
+bool_label() {
+  if [ "${1:-0}" = "1" ]; then
+    color "$C_GREEN" "enabled"
+  else
+    color "$C_YELLOW" "disabled"
+  fi
+}
+
+show_whitelist_status() {
+  load_config
+  printf "%b状态:%b 白名单 %s | 地区来源 %s | 已选地区 %s | 手动 %s\n" \
+    "$C_BOLD" "$C_RESET" \
+    "$(bool_label "$WHITELIST_ENABLE")" \
+    "$(bool_label "$REGION_WHITELIST_ENABLE")" \
+    "$(region_whitelist_count)" \
+    "$(manual_whitelist_count)"
+}
+
+create_whitelist_backup() {
+  local backup_dir
+
+  backup_dir="$(mktemp -d /tmp/nft-forward.whitelist.backup.XXXXXX)"
+  if [ -f "${CONFIG_FILE}" ]; then
+    cp -a "${CONFIG_FILE}" "${backup_dir}/config.env"
+  else
+    : > "${backup_dir}/config.env.missing"
+  fi
+  cp -a "${REGION_CODES_FILE}" "${backup_dir}/region_whitelist.codes"
+  cp -a "${MANUAL_WHITELIST_FILE}" "${backup_dir}/manual_whitelist.list"
+  printf "%s\n" "$backup_dir"
+}
+
+restore_whitelist_backup() {
+  local backup_dir="$1"
+
+  if [ -f "${backup_dir}/config.env.missing" ]; then
+    rm -f "${CONFIG_FILE}"
+  else
+    cp -a "${backup_dir}/config.env" "${CONFIG_FILE}"
+  fi
+  cp -a "${backup_dir}/region_whitelist.codes" "${REGION_CODES_FILE}"
+  cp -a "${backup_dir}/manual_whitelist.list" "${MANUAL_WHITELIST_FILE}"
+}
+
+finish_whitelist_change() {
+  local backup_dir="$1"
+  local success_message="$2"
+
+  if apply_rules; then
+    rm -rf "$backup_dir"
+    echo_ok "$success_message"
+    return 0
+  fi
+
+  restore_whitelist_backup "$backup_dir"
+  rm -rf "$backup_dir"
+  echo_err "操作失败，已回滚白名单配置。"
+  return 1
+}
+
+finish_region_whitelist_change() {
+  local backup_dir="$1"
+  local success_message="$2"
+
+  load_config
+  if [ "${WHITELIST_ENABLE:-0}" = "1" ] && [ "${REGION_WHITELIST_ENABLE:-0}" = "1" ]; then
+    finish_whitelist_change "$backup_dir" "$success_message"
+    return $?
+  fi
+
+  rm -rf "$backup_dir"
+  if [ "${REGION_WHITELIST_ENABLE:-0}" != "1" ]; then
+    echo_ok "${success_message}（地区白名单来源未开启，仅保存配置，暂不生效。）"
+  else
+    echo_ok "${success_message}（白名单限制未开启，仅保存配置，暂不生效。）"
+  fi
+  return 0
+}
+
+load_region_codes() {
+  mapfile -t REGION_CODES < <(awk '
+    {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      if ($0 != "" && substr($0, 1, 1) != "#") print $0
+    }
+  ' "${REGION_CODES_FILE}")
+}
+
+describe_region_code() {
+  local code="$1"
+  local line
+
+  line="$(region_tool describe-codes "$code" 2>/dev/null | head -n 1 || true)"
+  if [ -n "$line" ]; then
+    printf "%s\n" "${line#*$'\t'}"
+  else
+    printf "%s\n" "$code"
+  fi
+}
+
+show_selected_regions() {
+  local i code name
+
+  load_region_codes
+  if [ "${#REGION_CODES[@]}" -eq 0 ]; then
+    echo_info "暂无已选省/市。"
+    return 0
+  fi
+
+  for i in "${!REGION_CODES[@]}"; do
+    code="${REGION_CODES[$i]}"
+    name="$(describe_region_code "$code")"
+    printf "%-4s %-8s %s\n" "$((i + 1))." "$code" "$name"
+  done
+}
+
+show_manual_whitelist() {
+  local entries=()
+  local i
+
+  mapfile -t entries < <(collect_manual_whitelist_entries 2>/dev/null || true)
+  if [ "${#entries[@]}" -eq 0 ]; then
+    echo_info "暂无手动白名单。"
+    return 0
+  fi
+
+  for i in "${!entries[@]}"; do
+    printf "%-4s %s\n" "$((i + 1))." "${entries[$i]}"
+  done
+}
+
+remove_indices_from_file() {
+  local file="$1"
+  local indices="$2"
+  local tmp_file
+
+  tmp_file="$(mktemp /tmp/nft-forward.list.new.XXXXXX)"
+  awk -v list="$indices" '
+    BEGIN {
+      split(list, values, " ")
+      for (i in values) {
+        if (values[i] ~ /^[0-9]+$/) remove[values[i]] = 1
+      }
+    }
+    !(NR in remove) { print $0 }
+  ' "$file" > "$tmp_file"
+  mv "$tmp_file" "$file"
+}
+
+manage_whitelist_switch() {
+  local choice backup_dir
+
+  while true; do
+    clear_screen
+    print_section "白名单总开关"
+    show_whitelist_status
+    echo ""
+    print_menu_item "1" "开启白名单限制"
+    print_menu_item "2" "关闭白名单限制"
+    print_menu_item "0" "返回"
+
+    prompt_input "请选择 [0-2]: " || return 1
+    choice="$(trim_value "$REPLY")"
+    case "$choice" in
+      1)
+        backup_dir="$(create_whitelist_backup)"
+        load_config
+        WHITELIST_ENABLE=1
+        ensure_current_ssh_ip_whitelisted || {
+          restore_whitelist_backup "$backup_dir"
+          rm -rf "$backup_dir"
+          return 1
+        }
+        save_config
+        finish_whitelist_change "$backup_dir" "白名单限制已开启。"
+        pause_for_menu
+        return 0
+        ;;
+      2)
+        backup_dir="$(create_whitelist_backup)"
+        load_config
+        WHITELIST_ENABLE=0
+        save_config
+        finish_whitelist_change "$backup_dir" "白名单限制已关闭。"
+        pause_for_menu
+        return 0
+        ;;
+      0) return 0 ;;
+      *) echo_err "无效选项，请输入 0-2。" ;;
+    esac
+  done
+}
+
+toggle_region_whitelist_source() {
+  local backup_dir
+
+  backup_dir="$(create_whitelist_backup)"
+  load_config
+  if [ "$REGION_WHITELIST_ENABLE" = "1" ]; then
+    REGION_WHITELIST_ENABLE=0
+  else
+    REGION_WHITELIST_ENABLE=1
+  fi
+  save_config
+  finish_whitelist_change "$backup_dir" "地区白名单来源状态已更新。"
+}
+
+add_region_provinces() {
+  local input selector code backup_dir added=0
+
+  print_section "添加省份"
+  region_tool show-provinces || return 1
+  prompt_input "请输入省份编号/名称，可多选: " || return 1
+  input="$REPLY"
+
+  backup_dir="$(create_whitelist_backup)"
+  while IFS= read -r selector; do
+    [ -n "$selector" ] || continue
+    if code="$(region_tool resolve-province "$selector")"; then
+      append_unique_line "${REGION_CODES_FILE}" "$code"
+      added=$((added + 1))
+    else
+      restore_whitelist_backup "$backup_dir"
+      rm -rf "$backup_dir"
+      return 1
+    fi
+  done < <(split_user_list "$input")
+
+  if [ "$added" -eq 0 ]; then
+    restore_whitelist_backup "$backup_dir"
+    rm -rf "$backup_dir"
+    echo_warn "未添加任何省份。"
+    return 0
+  fi
+
+  finish_region_whitelist_change "$backup_dir" "省份白名单已更新。"
+}
+
+add_region_cities() {
+  local province_selector province_code input selector code backup_dir added=0
+
+  print_section "添加城市"
+  region_tool show-provinces || return 1
+  prompt_input "请先输入省份编号/名称: " || return 1
+  province_selector="$(trim_value "$REPLY")"
+  [ -n "$province_selector" ] || return 1
+  province_code="$(region_tool resolve-province "$province_selector")" || return 1
+
+  region_tool show-cities "$province_code" || return 1
+  prompt_input "请输入城市编号/名称，可多选；输入 0 表示全省/全市: " || return 1
+  input="$(trim_value "$REPLY")"
+  [ -n "$input" ] || return 1
+
+  backup_dir="$(create_whitelist_backup)"
+  if [ "$input" = "0" ] || [ "$input" = "全省" ] || [ "$input" = "全市" ]; then
+    append_unique_line "${REGION_CODES_FILE}" "$province_code"
+    added=1
+  else
+    while IFS= read -r selector; do
+      [ -n "$selector" ] || continue
+      if code="$(region_tool resolve-city "$province_code" "$selector")"; then
+        append_unique_line "${REGION_CODES_FILE}" "$code"
+        added=$((added + 1))
+      else
+        restore_whitelist_backup "$backup_dir"
+        rm -rf "$backup_dir"
+        return 1
+      fi
+    done < <(split_user_list "$input")
+  fi
+
+  if [ "$added" -eq 0 ]; then
+    restore_whitelist_backup "$backup_dir"
+    rm -rf "$backup_dir"
+    echo_warn "未添加任何城市。"
+    return 0
+  fi
+
+  finish_region_whitelist_change "$backup_dir" "城市白名单已更新。"
+}
+
+delete_selected_regions() {
+  local input index backup_dir
+
+  print_section "删除省/市"
+  show_selected_regions
+  if [ "$(region_whitelist_count)" -eq 0 ]; then
+    return 0
+  fi
+
+  prompt_input "请输入要删除的编号，可多选: " || return 1
+  input="$(trim_value "$REPLY")"
+  [ -n "$input" ] || return 1
+
+  for index in $(split_user_list "$input"); do
+    [[ "$index" =~ ^[0-9]+$ ]] || {
+      echo_err "编号非法: ${index}"
+      return 1
+    }
+  done
+
+  backup_dir="$(create_whitelist_backup)"
+  remove_indices_from_file "${REGION_CODES_FILE}" "$(split_user_list "$input" | tr '\n' ' ')"
+  finish_region_whitelist_change "$backup_dir" "地区白名单已删除所选项。"
+}
+
+clear_selected_regions() {
+  local backup_dir
+
+  if ! prompt_yes_no "确认清空所有地区白名单? [y/N]: " "no"; then
+    return 0
+  fi
+
+  backup_dir="$(create_whitelist_backup)"
+  : > "${REGION_CODES_FILE}"
+  finish_region_whitelist_change "$backup_dir" "地区白名单已清空。"
+}
+
+manage_region_whitelist() {
+  local choice
+
+  while true; do
+    clear_screen
+    print_section "地区白名单管理"
+    show_whitelist_status
+    echo ""
+    print_menu_item "1" "开启/关闭地区白名单来源"
+    print_menu_item "2" "添加省份"
+    print_menu_item "3" "添加城市"
+    print_menu_item "4" "删除省/市"
+    print_menu_item "5" "查看已选省/市"
+    print_menu_item "6" "清空地区白名单"
+    print_menu_item "0" "返回"
+
+    prompt_input "请选择 [0-6]: " || return 1
+    choice="$(trim_value "$REPLY")"
+    case "$choice" in
+      1) toggle_region_whitelist_source; pause_for_menu ;;
+      2) add_region_provinces; pause_for_menu ;;
+      3) add_region_cities; pause_for_menu ;;
+      4) delete_selected_regions; pause_for_menu ;;
+      5) show_selected_regions; pause_for_menu ;;
+      6) clear_selected_regions; pause_for_menu ;;
+      0) return 0 ;;
+      *) echo_err "无效选项，请输入 0-6。" ;;
+    esac
+  done
+}
+
+add_manual_whitelist() {
+  local input entry backup_dir added=0
+
+  print_section "添加手动白名单"
+  prompt_input "请输入 IP/CIDR，可一次输入多个: " || return 1
+  input="$REPLY"
+
+  backup_dir="$(create_whitelist_backup)"
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    add_manual_whitelist_entry "$entry" || {
+      restore_whitelist_backup "$backup_dir"
+      rm -rf "$backup_dir"
+      return 1
+    }
+    added=$((added + 1))
+  done < <(split_user_list "$input")
+
+  if [ "$added" -eq 0 ]; then
+    restore_whitelist_backup "$backup_dir"
+    rm -rf "$backup_dir"
+    echo_warn "未添加任何 IP/CIDR。"
+    return 0
+  fi
+
+  finish_whitelist_change "$backup_dir" "手动白名单已更新。"
+}
+
+delete_manual_whitelist() {
+  local input index backup_dir ssh_ip="" entries=() selected_entry
+
+  print_section "删除手动白名单"
+  mapfile -t entries < <(collect_manual_whitelist_entries 2>/dev/null || true)
+  show_manual_whitelist
+  if [ "${#entries[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  prompt_input "请输入要删除的编号，可多选: " || return 1
+  input="$(trim_value "$REPLY")"
+  [ -n "$input" ] || return 1
+
+  load_config
+  ssh_ip="$(detect_ssh_client_ip 2>/dev/null || true)"
+  for index in $(split_user_list "$input"); do
+    [[ "$index" =~ ^[0-9]+$ ]] || {
+      echo_err "编号非法: ${index}"
+      return 1
+    }
+    if [ "$index" -ge 1 ] && [ "$index" -le "${#entries[@]}" ]; then
+      selected_entry="${entries[$((index - 1))]}"
+      if [ "$WHITELIST_ENABLE" = "1" ] && [ -n "$ssh_ip" ] && [ "$selected_entry" = "$ssh_ip" ]; then
+        prompt_input "正在删除当前 SSH IP (${ssh_ip})，请输入 YES 确认: " || return 1
+        if [ "$(trim_value "$REPLY")" != "YES" ]; then
+          echo_warn "已取消删除当前 SSH IP。"
+          return 0
+        fi
+      fi
+    fi
+  done
+
+  backup_dir="$(create_whitelist_backup)"
+  remove_indices_from_file "${MANUAL_WHITELIST_FILE}" "$(split_user_list "$input" | tr '\n' ' ')"
+  finish_whitelist_change "$backup_dir" "手动白名单已删除所选项。"
+}
+
+clear_manual_whitelist() {
+  local backup_dir ssh_ip=""
+
+  if ! prompt_yes_no "确认清空所有手动白名单? [y/N]: " "no"; then
+    return 0
+  fi
+
+  backup_dir="$(create_whitelist_backup)"
+  load_config
+  : > "${MANUAL_WHITELIST_FILE}"
+
+  if [ "$WHITELIST_ENABLE" = "1" ]; then
+    if ssh_ip="$(detect_ssh_client_ip)" && is_valid_ipv4 "$ssh_ip"; then
+      add_manual_whitelist_entry "$ssh_ip" || {
+        restore_whitelist_backup "$backup_dir"
+        rm -rf "$backup_dir"
+        return 1
+      }
+      echo_ok "白名单限制已开启，已保留当前 SSH IP: ${ssh_ip}"
+    else
+      echo_warn "白名单限制已开启，但未检测到当前 SSH IPv4。"
+    fi
+  fi
+
+  finish_whitelist_change "$backup_dir" "手动白名单已清空。"
+}
+
+manage_manual_whitelist() {
+  local choice
+
+  while true; do
+    clear_screen
+    print_section "手动白名单管理"
+    echo "当前数量: $(manual_whitelist_count)"
+    echo ""
+    print_menu_item "1" "添加 IP/CIDR"
+    print_menu_item "2" "删除 IP/CIDR"
+    print_menu_item "3" "查看手动白名单"
+    print_menu_item "4" "清空手动白名单"
+    print_menu_item "0" "返回"
+
+    prompt_input "请选择 [0-4]: " || return 1
+    choice="$(trim_value "$REPLY")"
+    case "$choice" in
+      1) add_manual_whitelist; pause_for_menu ;;
+      2) delete_manual_whitelist; pause_for_menu ;;
+      3) show_manual_whitelist; pause_for_menu ;;
+      4) clear_manual_whitelist; pause_for_menu ;;
+      0) return 0 ;;
+      *) echo_err "无效选项，请输入 0-4。" ;;
+    esac
+  done
+}
+
+manage_whitelist() {
+  local choice
+
+  while true; do
+    clear_screen
+    print_section "白名单管理"
+    show_whitelist_status
+    echo ""
+    print_menu_item "1" "白名单总开关"
+    print_menu_item "2" "地区白名单管理"
+    print_menu_item "3" "手动白名单管理"
+    print_menu_item "0" "返回主菜单"
+
+    prompt_input "请选择 [0-3]: " || return 1
+    choice="$(trim_value "$REPLY")"
+    case "$choice" in
+      1) manage_whitelist_switch ;;
+      2) manage_region_whitelist ;;
+      3) manage_manual_whitelist ;;
+      0) return 0 ;;
+      *) echo_err "无效选项，请输入 0-3。" ;;
+    esac
+  done
 }
 
 print_menu() {
@@ -783,7 +1695,8 @@ print_menu() {
   print_menu_item "3" "添加转发"
   print_menu_item "4" "修改转发"
   print_menu_item "5" "删除转发"
-  print_menu_item "6" "卸载"
+  print_menu_item "6" "白名单管理"
+  print_menu_item "7" "卸载"
   print_menu_item "0" "退出脚本"
 }
 
@@ -1325,12 +2238,13 @@ main_loop() {
   local choice
 
   while true; do
+    clear_screen
     print_header
     status_line
     print_section "主菜单"
     print_menu
 
-    if ! prompt_input "请选择 [0-6]: "; then
+    if ! prompt_input "请选择 [0-7]: "; then
       echo ""
       exit 0
     fi
@@ -1342,13 +2256,14 @@ main_loop() {
       3) add_forward ;;
       4) modify_forward ;;
       5) delete_forward ;;
-      6) uninstall_all ;;
+      6) manage_whitelist; continue ;;
+      7) uninstall_all ;;
       0)
         echo_ok "已退出。"
         exit 0
         ;;
       *)
-        echo_err "无效选项，请输入 0-6。"
+        echo_err "无效选项，请输入 0-7。"
         ;;
     esac
 
