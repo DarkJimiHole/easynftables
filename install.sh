@@ -4,9 +4,10 @@ set -u
 set -o pipefail
 
 APP_NAME="nft-forward"
-SCRIPT_VERSION="v1.4"
+SCRIPT_VERSION="v1.4.1"
 SHORTCUT_NAME="nf"
 SCRIPT_RAW_URL="https://raw.githubusercontent.com/DarkJimiHole/easynftables/main/install.sh"
+REPO_RAW_BASE_URL="https://raw.githubusercontent.com/DarkJimiHole/easynftables/main"
 SHORTCUT_BIN="/usr/local/bin/${SHORTCUT_NAME}"
 SHORTCUT_SBIN="/usr/local/sbin/${SHORTCUT_NAME}"
 LEGACY_SHORTCUT_BIN="/usr/local/bin/${APP_NAME}"
@@ -210,18 +211,28 @@ region_tool() {
   local tool data_dir
 
   if ! tool="$(region_tool_file)"; then
-    echo_err "missing tools/region_tool.py."
+    echo_err "地区白名单资源缺失: missing tools/region_tool.py. 请重新执行安装脚本以安装资源。"
     return 1
   fi
   if ! data_dir="$(region_data_dir)"; then
-    echo_err "missing data/regions.json or data/regions/."
+    echo_err "地区白名单资源缺失: missing data/regions.json or data/regions. 请重新执行安装脚本以安装资源。"
     return 1
   fi
 
   po0_python "$tool" --regions-json "${data_dir}/regions.json" --data-dir "$data_dir" "$@"
 }
 
+region_assets_ready() {
+  [ -f "${APP_DIR}/tools/region_tool.py" ] \
+    && [ -f "${APP_DIR}/data/regions.json" ] \
+    && [ -d "${APP_DIR}/data/regions" ]
+}
+
 install_region_assets() {
+  if region_assets_ready; then
+    return 0
+  fi
+
   if [ -f "${SCRIPT_DIR}/tools/region_tool.py" ]; then
     mkdir -p "${APP_DIR}/tools"
     cp -a "${SCRIPT_DIR}/tools/region_tool.py" "${APP_DIR}/tools/region_tool.py"
@@ -235,6 +246,95 @@ install_region_assets() {
     cp -a "${SCRIPT_DIR}/data/regions" "${APP_DIR}/data/regions"
     chmod -R go-rwx "${APP_DIR}/data" 2>/dev/null || true
   fi
+
+  if region_assets_ready; then
+    return 0
+  fi
+
+  download_region_assets
+}
+
+download_region_assets() {
+  local tmp_dir file_list rel_path
+
+  if ! have_cmd curl && ! have_cmd wget; then
+    echo_err "missing curl/wget; cannot download region whitelist assets."
+    return 1
+  fi
+
+  if ! have_cmd python3 && ! have_cmd python; then
+    echo_err "missing python3/python; cannot parse region whitelist metadata."
+    return 1
+  fi
+
+  tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t "${APP_NAME}.assets.XXXXXX")" || {
+    echo_err "failed to create temporary directory for region whitelist assets."
+    return 1
+  }
+
+  mkdir -p "${tmp_dir}/tools" "${tmp_dir}/data/regions"
+
+  if ! download_file "${REPO_RAW_BASE_URL}/tools/region_tool.py" "${tmp_dir}/tools/region_tool.py"; then
+    rm -rf "$tmp_dir"
+    echo_err "failed to download tools/region_tool.py from GitHub."
+    return 1
+  fi
+
+  if ! download_file "${REPO_RAW_BASE_URL}/data/regions.json" "${tmp_dir}/data/regions.json"; then
+    rm -rf "$tmp_dir"
+    echo_err "failed to download data/regions.json from GitHub."
+    return 1
+  fi
+
+  file_list="${tmp_dir}/region_files.list"
+  if ! po0_python - "${tmp_dir}/data/regions.json" >"$file_list" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    metadata = json.load(fh)
+
+for province in metadata.get("provinces", []):
+    if province.get("file"):
+        print(province["file"])
+    for city in province.get("cities", []):
+        if city.get("file"):
+            print(city["file"])
+PY
+  then
+    rm -rf "$tmp_dir"
+    echo_err "failed to parse data/regions.json."
+    return 1
+  fi
+
+  while IFS= read -r rel_path; do
+    [ -n "$rel_path" ] || continue
+    case "$rel_path" in
+      regions/*.txt) ;;
+      *)
+        rm -rf "$tmp_dir"
+        echo_err "unsafe region file path in metadata: $rel_path"
+        return 1
+        ;;
+    esac
+
+    if ! download_file "${REPO_RAW_BASE_URL}/data/${rel_path}" "${tmp_dir}/data/${rel_path}"; then
+      rm -rf "$tmp_dir"
+      echo_err "failed to download data/${rel_path} from GitHub."
+      return 1
+    fi
+  done <"$file_list"
+
+  mkdir -p "${APP_DIR}/tools" "${APP_DIR}/data"
+  cp -a "${tmp_dir}/tools/region_tool.py" "${APP_DIR}/tools/region_tool.py"
+  cp -a "${tmp_dir}/data/regions.json" "${APP_DIR}/data/regions.json"
+  rm -rf "${APP_DIR}/data/regions"
+  cp -a "${tmp_dir}/data/regions" "${APP_DIR}/data/regions"
+  chmod 600 "${APP_DIR}/tools/region_tool.py" 2>/dev/null || true
+  chmod -R go-rwx "${APP_DIR}/data" 2>/dev/null || true
+  rm -rf "$tmp_dir"
+
+  echo_ok "地区白名单资源已安装。"
 }
 
 detect_ssh_client_ip() {
@@ -1000,7 +1100,6 @@ apply_rules() {
   local sets_existed=0
 
   load_config
-  install_region_assets
   ensure_whitelist_safe || return 1
 
   if [ -s "${RULES_FILE}" ] && [ -z "$RELAY_LAN_IP" ]; then
@@ -1161,7 +1260,9 @@ self_install() {
   install -d -m 0755 "$(dirname "$SHORTCUT_SBIN")"
   install -m 0755 "$self" "$SHORTCUT_BIN"
   install -m 0755 "$self" "$SHORTCUT_SBIN"
-  install_region_assets
+  if ! install_region_assets; then
+    echo_warn "地区白名单资源未安装成功；普通转发不受影响，但省/市白名单功能暂不可用。"
+  fi
 
   rm -f "${LEGACY_SHORTCUT_BIN}" "${LEGACY_SHORTCUT_SBIN}" 2>/dev/null || true
   rm -f "$tmp_file"
@@ -2281,6 +2382,9 @@ main() {
 
   ensure_root
   ensure_storage
+  if [ "$#" -eq 0 ]; then
+    self_install
+  fi
 
   case "${1:-}" in
     --install-self)
