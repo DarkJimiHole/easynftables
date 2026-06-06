@@ -4,10 +4,10 @@ set -u
 set -o pipefail
 
 APP_NAME="nft-forward"
-SCRIPT_VERSION="v1.4.1"
+SCRIPT_VERSION="v1.4.2"
 SHORTCUT_NAME="nf"
 SCRIPT_RAW_URL="https://raw.githubusercontent.com/DarkJimiHole/easynftables/main/install.sh"
-REPO_RAW_BASE_URL="https://raw.githubusercontent.com/DarkJimiHole/easynftables/main"
+REPO_ARCHIVE_URL="https://codeload.github.com/DarkJimiHole/easynftables/zip/refs/heads/main"
 SHORTCUT_BIN="/usr/local/bin/${SHORTCUT_NAME}"
 SHORTCUT_SBIN="/usr/local/sbin/${SHORTCUT_NAME}"
 LEGACY_SHORTCUT_BIN="/usr/local/bin/${APP_NAME}"
@@ -255,7 +255,7 @@ install_region_assets() {
 }
 
 download_region_assets() {
-  local tmp_dir file_list rel_path
+  local tmp_dir archive_file extract_dir
 
   if ! have_cmd curl && ! have_cmd wget; then
     echo_err "missing curl/wget; cannot download region whitelist assets."
@@ -272,69 +272,93 @@ download_region_assets() {
     return 1
   }
 
-  mkdir -p "${tmp_dir}/tools" "${tmp_dir}/data/regions"
+  archive_file="${tmp_dir}/easynftables-main.zip"
+  extract_dir="${tmp_dir}/extract"
+  mkdir -p "$extract_dir"
 
-  if ! download_file "${REPO_RAW_BASE_URL}/tools/region_tool.py" "${tmp_dir}/tools/region_tool.py"; then
+  if ! download_file "$REPO_ARCHIVE_URL" "$archive_file"; then
     rm -rf "$tmp_dir"
-    echo_err "failed to download tools/region_tool.py from GitHub."
+    echo_err "failed to download region whitelist archive from GitHub."
     return 1
   fi
 
-  if ! download_file "${REPO_RAW_BASE_URL}/data/regions.json" "${tmp_dir}/data/regions.json"; then
+  if ! extract_region_assets_from_archive "$archive_file" "$extract_dir"; then
     rm -rf "$tmp_dir"
-    echo_err "failed to download data/regions.json from GitHub."
+    echo_err "failed to extract region whitelist assets from archive."
     return 1
   fi
-
-  file_list="${tmp_dir}/region_files.list"
-  if ! po0_python - "${tmp_dir}/data/regions.json" >"$file_list" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], "r", encoding="utf-8") as fh:
-    metadata = json.load(fh)
-
-for province in metadata.get("provinces", []):
-    if province.get("file"):
-        print(province["file"])
-    for city in province.get("cities", []):
-        if city.get("file"):
-            print(city["file"])
-PY
-  then
-    rm -rf "$tmp_dir"
-    echo_err "failed to parse data/regions.json."
-    return 1
-  fi
-
-  while IFS= read -r rel_path; do
-    [ -n "$rel_path" ] || continue
-    case "$rel_path" in
-      regions/*.txt) ;;
-      *)
-        rm -rf "$tmp_dir"
-        echo_err "unsafe region file path in metadata: $rel_path"
-        return 1
-        ;;
-    esac
-
-    if ! download_file "${REPO_RAW_BASE_URL}/data/${rel_path}" "${tmp_dir}/data/${rel_path}"; then
-      rm -rf "$tmp_dir"
-      echo_err "failed to download data/${rel_path} from GitHub."
-      return 1
-    fi
-  done <"$file_list"
 
   mkdir -p "${APP_DIR}/tools" "${APP_DIR}/data"
-  cp -a "${tmp_dir}/tools/region_tool.py" "${APP_DIR}/tools/region_tool.py"
-  cp -a "${tmp_dir}/data/regions.json" "${APP_DIR}/data/regions.json"
+  cp -a "${extract_dir}/tools/region_tool.py" "${APP_DIR}/tools/region_tool.py"
+  cp -a "${extract_dir}/data/regions.json" "${APP_DIR}/data/regions.json"
   rm -rf "${APP_DIR}/data/regions"
-  cp -a "${tmp_dir}/data/regions" "${APP_DIR}/data/regions"
+  cp -a "${extract_dir}/data/regions" "${APP_DIR}/data/regions"
   chmod 600 "${APP_DIR}/tools/region_tool.py" 2>/dev/null || true
   chmod -R go-rwx "${APP_DIR}/data" 2>/dev/null || true
   rm -rf "$tmp_dir"
 
   echo_ok "地区白名单资源已安装。"
+}
+
+extract_region_assets_from_archive() {
+  local archive_file="$1"
+  local output_dir="$2"
+
+  po0_python - "$archive_file" "$output_dir" <<'PY'
+import shutil
+import sys
+import zipfile
+from pathlib import Path
+
+archive = Path(sys.argv[1])
+output_dir = Path(sys.argv[2])
+
+with zipfile.ZipFile(archive) as zf:
+    root = None
+    for info in zf.infolist():
+        name = info.filename
+        if "/" not in name:
+            continue
+        top, rel = name.split("/", 1)
+        if (
+            rel == "tools/region_tool.py"
+            or rel == "data/regions.json"
+            or rel.startswith("data/regions/")
+        ):
+            root = top + "/"
+            break
+
+    if not root:
+        raise SystemExit("archive does not contain region whitelist assets")
+
+    copied = 0
+    for info in zf.infolist():
+        name = info.filename
+        if info.is_dir() or not name.startswith(root):
+            continue
+        rel = name[len(root):]
+        if rel == "tools/region_tool.py" or rel == "data/regions.json":
+            pass
+        elif rel.startswith("data/regions/") and rel.endswith(".txt"):
+            pass
+        else:
+            continue
+
+        target = output_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as src, target.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+        copied += 1
+
+if not (output_dir / "tools" / "region_tool.py").is_file():
+    raise SystemExit("archive missing tools/region_tool.py")
+if not (output_dir / "data" / "regions.json").is_file():
+    raise SystemExit("archive missing data/regions.json")
+if not (output_dir / "data" / "regions").is_dir():
+    raise SystemExit("archive missing data/regions")
+if copied < 3:
+    raise SystemExit("archive contains too few region whitelist files")
+PY
 }
 
 detect_ssh_client_ip() {
